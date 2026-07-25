@@ -20,6 +20,7 @@ Examples:
 """
 
 from __future__ import annotations
+from html import parser
 from gooey import Gooey, GooeyParser
 
 import sys
@@ -539,116 +540,123 @@ def add_event_to_dates(
 
 
 # ---------------------------------------------------------
-# ICS Parsing - Main Function
+# ICS Parsing Class
 # ---------------------------------------------------------
-def load_events_from_ics(
-    path: str,
-    span_start_date: date,
-    span_end_date: date,
-    highlight_tag: str,
-    default_tz: Optional[tzinfo] = None
-) -> Dict[date, List[CalEvent]]:
+class ICSEventParser:
     """
-    Load and parse events from an ICS file.
-    
-    Expands single events and RRULE/RDATE/EXDATE occurrences that fall 
-    within the specified date span. Multi-day events are added to each 
-    date they span.
-    
-    Args:
-        path: Path to the ICS file.
-        span_start_date: Start of the date range to include.
-        span_end_date: End of the date range to include.
-        highlight_tag: Tag to look for in event titles (e.g., "#highlight").
-        default_tz: Default timezone if not specified in calendar.
-    
-    Returns:
-        Dictionary mapping dates to lists of CalEvent objects.
-    
-    Raises:
-        FileNotFoundError: If the ICS file doesn't exist.
-        ValueError: If the ICS file is malformed.
+    Parses an ICS file and extracts events falling within a specific date range,
+    handling recurrences, timezone normalization, and tag extraction.
     """
-    with open(path, "rb") as f:
-        cal = Calendar.from_ical(f.read())
-    
-    cal_tz = extract_calendar_timezone(cal, default_tz)
-    recurrence_exceptions = collect_recurrence_exceptions(cal)
-    events_by_date: Dict[date, List[CalEvent]] = defaultdict(list)
-    
-    span_start_dt = datetime.combine(span_start_date, time.min).replace(tzinfo=cal_tz)
-    span_end_dt = datetime.combine(span_end_date, time.max).replace(tzinfo=cal_tz)
-    
-    for component in cal.walk():
-        if component.name != "VEVENT":
-            continue
+    def __init__(
+        self, 
+        ics_path: str, 
+        span_start_date: date, 
+        span_end_date: date, 
+        highlight_tag: str, 
+        default_tz: Optional[tzinfo] = None
+    ):
+        self.ics_path = ics_path
+        self.span_start_date = span_start_date
+        self.span_end_date = span_end_date
+        self.highlight_tag = highlight_tag
+        self.default_tz = default_tz
         
-        # Skip cancelled events
+        # State populated during parsing
+        self.events_by_date: Dict[date, List[CalEvent]] = defaultdict(list)
+        self.cal_tz: tzinfo = tzlocal()
+        self.recurrence_exceptions: Dict[str, Set[date]] = defaultdict(set)
+        
+        # Datetime representations of the spans
+        self.span_start_dt: Optional[datetime] = None
+        self.span_end_dt: Optional[datetime] = None
+
+    def parse(self) -> Dict[date, List[CalEvent]]:
+        """Main orchestrator to load, parse, and return sorted events."""
+        with open(self.ics_path, "rb") as f:
+            cal = Calendar.from_ical(f.read())
+        
+        # Setup calendar state
+        self.cal_tz = extract_calendar_timezone(cal, self.default_tz)
+        self.recurrence_exceptions = collect_recurrence_exceptions(cal)
+        
+        self.span_start_dt = datetime.combine(self.span_start_date, time.min).replace(tzinfo=self.cal_tz)
+        self.span_end_dt = datetime.combine(self.span_end_date, time.max).replace(tzinfo=self.cal_tz)
+        
+        # Process each component[cite: 1]
+        for component in cal.walk():
+            if component.name == "VEVENT":
+                self._process_vevent(component)
+        
+        # Sort events within each date[cite: 1]
+        for d in self.events_by_date:
+            self.events_by_date[d].sort(key=lambda e: (not e.all_day, e.start))
+            
+        return self.events_by_date
+
+    def _process_vevent(self, component: Component) -> None:
+        """Process a single VEVENT component."""
         status = component.get('STATUS')
         if status and str(status).upper() == 'CANCELLED':
-            continue
-        
+            return
+            
         uid = str(component.get("UID", ""))
         raw_summary = str(component.get("SUMMARY", ""))
+        clean_summary, has_tag = extract_tag_from_title(raw_summary, self.highlight_tag)
         
-        # Extract tag and clean title
-        clean_summary, has_tag = extract_tag_from_title(raw_summary, highlight_tag)
-        
-        # Parse start time
         try:
             dtstart = component.decoded("DTSTART")
         except (KeyError, ValueError) as e:
             print(f"Warning: Could not parse DTSTART for event: {e}")
-            continue
-        
+            return
+            
         dtend = get_event_end_date(component, dtstart)
-        dtstart_t = normalize_datetime(dtstart, cal_tz)
-        dtend_t = normalize_datetime(dtend, cal_tz)
+        dtstart_t = normalize_datetime(dtstart, self.cal_tz)
+        dtend_t = normalize_datetime(dtend, self.cal_tz)
         
-        # Collect EXDATEs for this specific event
         exdates = collect_exdate_dates(component)
-        
-        # Check if this is a recurring event
         rrule_prop = component.get("RRULE")
         is_recurring = rrule_prop is not None
-
-        # Determine if this specific component is the exception itself
         is_exception_component = component.get("RECURRENCE-ID") is not None
         
-        # Expand occurrences
+        # Expand or create single occurrence
         if rrule_prop:
             occurrences = expand_recurrence(
-                component, dtstart, cal_tz, 
-                span_start_dt, span_end_dt, uid, exdates
+                component, dtstart, self.cal_tz, 
+                self.span_start_dt, self.span_end_dt, uid, exdates
             )
         else:
-            # Non-recurring event
             if isinstance(dtstart_t, date) and not isinstance(dtstart_t, datetime):
-                occ = datetime.combine(dtstart_t, time.min).replace(tzinfo=cal_tz)
+                occ = datetime.combine(dtstart_t, time.min).replace(tzinfo=self.cal_tz)
             else:
                 occ = dtstart_t
             occurrences = [occ] if occ else []
-        
-        # Add each occurrence to the date map
+            
+        self._map_occurrences_to_dates(
+            occurrences, uid, dtstart, dtend_t, dtstart_t, 
+            clean_summary, raw_summary, is_recurring, has_tag, is_exception_component
+        )
+
+    def _map_occurrences_to_dates(
+        self, occurrences: List[datetime], uid: str, dtstart: Union[date, datetime],
+        dtend_t: Optional[Union[date, datetime]], dtstart_t: Optional[Union[date, datetime]],
+        clean_summary: str, raw_summary: str, is_recurring: bool, has_tag: bool, 
+        is_exception_component: bool
+    ) -> None:
+        """Filters overrides and pushes valid occurrences into the event dictionary."""
         for occ_dt in occurrences:
             occ_date = occ_dt.date()
             
-            # Skip if this occurrence is overridden by an exception, 
-            # BUT do not skip if we are currently parsing the exception itself!
-            if not is_exception_component and occ_date in recurrence_exceptions.get(uid, set()):
+            # Skip if this occurrence is in the recurrence exceptions, 
+            # unless this component IS the exception
+            if not is_exception_component and occ_date in self.recurrence_exceptions.get(uid, set()):
                 continue
             
             add_event_to_dates(
-                events_by_date, occ_dt, dtstart, dtend_t, dtstart_t,
-                clean_summary, raw_summary, uid, span_start_date, span_end_date,
+                self.events_by_date, occ_dt, dtstart, dtend_t, dtstart_t,
+                clean_summary, raw_summary, uid, 
+                self.span_start_date, self.span_end_date,
                 is_recurring, has_tag
             )
-    
-    # Sort events within each date
-    for d in events_by_date:
-        events_by_date[d].sort(key=lambda e: (not e.all_day, e.start))
-    
-    return events_by_date
 
 
 # ---------------------------------------------------------
@@ -1167,9 +1175,8 @@ def main() -> None:
             out_path += ".pdf"
 
     try:
-        events = load_events_from_ics(
-            ics_path, span_start, span_end, highlight_tag, default_tz=tzlocal()
-        )
+        parser = ICSEventParser(ics_path, span_start, span_end, highlight_tag, default_tz=tzlocal())
+        events = parser.parse()
         draw_three_months_pdf(year, start_month, events, out_path, highlight_color)
     except FileNotFoundError:
         print(f"\n🛑 ERROR: ICS file not found: {ics_path}")
