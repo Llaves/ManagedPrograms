@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-calendar4.py
+3_month_calendar.py
 
 Generate a 3-month calendar grid on a LEGAL sheet (8.5" x 14") in PORTRAIT,
 black & white. Accepts an ICS file and places events into the day cells.
 
 Usage:
-    python calendar4.py YEAR START_MONTH ICS_PATH [--out OUTFILE] [--highlight-tag TAG] [--highlight-color COLOR]
+    python 3_month_calendar.py YEAR START_MONTH ICS_PATH [--out OUTFILE] [--highlight-tag TAG] [--highlight-color COLOR]
 
 Examples:
-    # Default: highlight events ending with "#highlight"
-    python calendar4.py 2026 5 calendar.ics
+    # Default: highlight events ending with "#r
+    python 3_month_calendar.py 2026 5 calendar.ics
     
     # Custom tag: highlight events ending with "#vacation"
-    python calendar4.py 2026 5 calendar.ics --highlight-tag "#vacation"
+    python 3_month_calendar.py 2026 5 calendar.ics --highlight-tag "#vacation"
     
     # Custom color: use a very pale blue instead of red
-    python calendar4.py 2026 5 calendar.ics --highlight-tag "#work" --highlight-color "lightblue"
+    python 3_month_calendar.py 2026 5 calendar.ics --highlight-tag "#work" --highlight-color "lightblue"
 """
 
 from __future__ import annotations
@@ -39,8 +39,7 @@ from dateutil.tz import tzlocal, gettz
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfmetrics
-from reportlab.lib.colors import Color, red, blue, green, yellow, pink, cyan, gray
-
+from reportlab.lib.colors import Color
 
 # ---------------------------------------------------------
 # Layout Constants
@@ -87,6 +86,7 @@ COLOR_MAP = {
     'yellow': Color(red=1.0, green=1.0, blue=0.85, alpha=1.0),    # Very pale yellow
     'pink': Color(red=1.0, green=0.85, blue=0.95, alpha=1.0),     # Very pale pink
     'cyan': Color(red=0.85, green=1.0, blue=1.0, alpha=1.0),      # Very pale cyan
+    'gray': Color(red=0.5, green=0.5, blue=0.5, alpha=1.0),          # Very pale gray
 }
 
 
@@ -264,69 +264,28 @@ def collect_recurrence_exceptions(cal: Calendar) -> Dict[str, Set[date]]:
     return exceptions
 
 
-def collect_exdate_dates(component: Component, uid: str) -> Set[date]:
-    """
-    Collect EXDATE exceptions from a VEVENT component.
-    
-    Args:
-        component: The VEVENT component.
-        uid: Event UID for error messages.
-    
-    Returns:
-        Set of dates to exclude.
-    """
+def collect_exdate_dates(component: Component) -> Set[date]:
     exdates: Set[date] = set()
-    
-    # Try to get EXDATE property (could be a single value or list)
     exdate_prop = component.get("EXDATE")
-    
-    if exdate_prop:
-        try:
-            # Handle if it's a list
-            if isinstance(exdate_prop, list):
-                for item in exdate_prop:
-                    if hasattr(item, 'dts'):
-                        for dt in item.dts:
-                            if isinstance(dt.dt, datetime):
-                                exdates.add(dt.dt.date())
-                            elif isinstance(dt.dt, date):
-                                exdates.add(dt.dt)
-                    else:
-                        # Try to decode directly
-                        try:
-                            decoded = component.decoded("EXDATE")
-                            if isinstance(decoded, list):
-                                for d in decoded:
-                                    if isinstance(d, datetime):
-                                        exdates.add(d.date())
-                                    elif isinstance(d, date):
-                                        exdates.add(d)
-                            elif isinstance(decoded, datetime):
-                                exdates.add(decoded.date())
-                            elif isinstance(decoded, date):
-                                exdates.add(decoded)
-                        except:
-                            pass
-            else:
-                # Single EXDATE
-                try:
-                    if hasattr(exdate_prop, 'dts'):
-                        for dt in exdate_prop.dts:
-                            if isinstance(dt.dt, datetime):
-                                exdates.add(dt.dt.date())
-                            elif isinstance(dt.dt, date):
-                                exdates.add(dt.dt)
-                    else:
-                        decoded = component.decoded("EXDATE")
-                        if isinstance(decoded, datetime):
-                            exdates.add(decoded.date())
-                        elif isinstance(decoded, date):
-                            exdates.add(decoded)
-                except:
-                    pass
-        except (AttributeError, ValueError, TypeError) as e:
-            print(f"Warning: Could not parse EXDATE for {uid}: {e}")
-    
+
+    if not exdate_prop:
+        return exdates
+
+    def add_exdate(value):
+        if isinstance(value, datetime):
+            exdates.add(value.date())
+        elif isinstance(value, date):
+            exdates.add(value)
+
+    items = exdate_prop if isinstance(exdate_prop, list) else [exdate_prop]
+
+    for item in items:
+        if hasattr(item, "dts"):
+            for dt in item.dts:
+                add_exdate(dt.dt if hasattr(dt, "dt") else dt)
+        else:
+            add_exdate(item)
+
     return exdates
 
 
@@ -421,8 +380,9 @@ def expand_recurrence(
             rrule_anchor = dtstart
         
         # Parse RRULE string
-        rrule_raw = rrule_prop.to_ical().decode()
-        rrule_str = rrule_raw.split(':', 1)[1] if ':' in rrule_raw else rrule_raw
+        rrule_raw = rrule_prop.to_ical()
+        rrule_ical = rrule_raw.decode() if isinstance(rrule_raw, bytes) else rrule_raw
+        rrule_str = rrule_ical.split(":", 1)[1] if ":" in rrule_ical else rrule_ical
         
         # Extract and handle UNTIL date separately
         rrule_cleaned, manual_until = parse_rrule_until_date(rrule_str)
@@ -517,9 +477,9 @@ def add_event_to_dates(
 ) -> None:
     """
     Add an event occurrence to the events_by_date dictionary.
-    
+
     Multi-day events are added to each date they span.
-    
+
     Args:
         events_by_date: Dictionary to populate.
         occ_dt: The occurrence datetime.
@@ -536,7 +496,7 @@ def add_event_to_dates(
     """
     is_all_day = isinstance(dtstart, date) and not isinstance(dtstart, datetime)
     start_d = occ_dt.date()
-    
+
     # Calculate end date
     if dtend_t is None:
         end_d = start_d
@@ -546,11 +506,22 @@ def add_event_to_dates(
     else:
         offset_td = dtend_t - dtstart_t
         end_d = (occ_dt + offset_td).date()
-    
+
+    # Calculate inclusive display end date
+    if dtend_t is None:
+        display_end_d = start_d
+    elif is_all_day:
+        offset_days = (dtend_t - dtstart_t).days
+        # DTEND is exclusive for all-day events
+        display_end_d = start_d + timedelta(days=offset_days - 1)
+    else:
+        offset_td = dtend_t - dtstart_t
+        display_end_d = (occ_dt + offset_td).date()
+
     # Create event object
     ev = CalEvent(
         start=occ_dt,
-        end=end_d if end_d > start_d else None,
+        end=display_end_d if display_end_d > start_d else None,
         all_day=is_all_day,
         title=summary,
         raw_title=raw_summary,
@@ -558,17 +529,13 @@ def add_event_to_dates(
         is_recurring=is_recurring,
         should_highlight=should_highlight
     )
-    
-    # Add to each date in the span
-    if start_d == end_d:
-        if span_start_date <= start_d <= span_end_date:
-            events_by_date[start_d].append(ev)
-    else:
-        cur = start_d
-        while cur < end_d:
-            if span_start_date <= cur <= span_end_date:
-                events_by_date[cur].append(ev)
-            cur += timedelta(days=1)
+
+    # Add to each date in the span (inclusive)
+    cur = start_d
+    while cur <= display_end_d:
+        if span_start_date <= cur <= span_end_date:
+            events_by_date[cur].append(ev)
+        cur += timedelta(days=1)
 
 
 # ---------------------------------------------------------
@@ -639,7 +606,7 @@ def load_events_from_ics(
         dtend_t = normalize_datetime(dtend, cal_tz)
         
         # Collect EXDATEs for this specific event
-        exdates = collect_exdate_dates(component, uid)
+        exdates = collect_exdate_dates(component)
         
         # Check if this is a recurring event
         rrule_prop = component.get("RRULE")
@@ -885,43 +852,52 @@ def should_highlight_cell(
 ) -> str:
     """
     Determine if and how to highlight a cell based on tagged events.
-    
+
     Args:
         evs: List of events for this day.
         check_date: The date to check.
-    
+
     Returns:
         'start' for first day (right half highlight),
         'end' for last day (left half highlight),
-        'middle' for middle days (full highlight),
+        'middle' for middle/single day (full highlight),
         '' for no highlight.
     """
-    # Find the longest tagged event covering this day
+    # Pick the longest tagged event covering this day
     best_ev = None
     best_duration = 0
-    
+
     for ev in evs:
-        if ev.should_highlight and ev.end:
-            duration = (ev.end - ev.start.date()).days
-            if duration > best_duration:
-                best_duration = duration
-                best_ev = ev
-    
-    if best_ev:
-        start_date = best_ev.start.date()
-        end_date = best_ev.end
-        
-        # Check if this is the first day
-        if check_date == start_date:
-            return 'start'
-        # Check if this is the last day
-        elif check_date == end_date - timedelta(days=1):
-            return 'end'
-        # Middle day
+        if not ev.should_highlight:
+            continue
+
+        # ev.end is None for single-day events, otherwise the inclusive end date
+        if ev.end is None:
+            duration = 1
         else:
-            return 'middle'
-    
-    return ''
+            duration = (ev.end - ev.start.date()).days + 1
+
+        if duration > best_duration:
+            best_duration = duration
+            best_ev = ev
+
+    if not best_ev:
+        return ''
+
+    start_date = best_ev.start.date()
+    end_date = best_ev.end or start_date  # single-day events have end == None
+
+    # Single-day event → full cell
+    if start_date == end_date:
+        return 'middle'
+
+    # Multi-day event
+    if check_date == start_date:
+        return 'start'
+    elif check_date == end_date:
+        return 'end'
+    else:
+        return 'middle'
 
 
 def draw_cell_events(
@@ -1076,7 +1052,7 @@ def draw_three_months_pdf(
                         prev_day = prev_last_day - (num_prev - 1 - col)
                         actual_date = date(prev_year, prev_month, prev_day)
                         # Draw day number in gray
-                        c.setFillColor(gray)
+                        c.setFillColor(parse_color('gray'))
                         c.setFont(FONT_NORMAL, DAY_NUMBER_FONT_SIZE)
                         c.drawString(
                             x + DAY_NUMBER_OFFSET_X, 
@@ -1121,116 +1097,92 @@ def draw_three_months_pdf(
 # ---------------------------------------------------------
 # CLI
 # ---------------------------------------------------------
-def parse_args(argv: List[str]) -> argparse.Namespace:
-    """
-    Parse command-line arguments.
-    
-    Args:
-        argv: List of command-line arguments.
-    
-    Returns:
-        Parsed arguments namespace.
-    """
+@Gooey(
+    program_name="3-Month Calendar Generator",
+    default_size=(500, 650),  # (width, height)
+)
+def main() -> None:
+    """Main GUI/CLI entry point."""
     parser = GooeyParser(
         description="Generate a 3-month calendar PDF from an ICS file."
     )
-    parser.add_argument("year", type=int, help="Starting year",
-                        default=datetime.now().year)
     parser.add_argument(
-        "start_month", 
-        type=int, 
-        default=datetime.now().month,
+        "year",
+        type=int,
+        default=datetime.now().year,
+        help="Starting year"
+    )
+    parser.add_argument(
+        "start_month",
+        type=int,
         choices=range(1, 13),
+        default=datetime.now().month,
         metavar="START_MONTH",
         help="Starting month (1-12)"
     )
     parser.add_argument(
         "ics_path",
         help="Path to the ICS calendar file",
-        widget='FileChooser',
-        gooey_options={'wildcard': 'Calendar files (*.ics;*.ical;*.cal)|*.ics;*.ical;*.cal|All files (*.*)|*.*'}
+        widget="FileChooser",
+        gooey_options={
+            "wildcard": "Calendar files (*.ics;*.ical;*.cal)|*.ics;*.ical;*.cal|All files (*.*)|*.*"
+        }
     )
     parser.add_argument(
-        "--out", "-o", 
+        "--out", "-o",
         default=None,
-        help="Output PDF filename (if only a name, placed in the input file's directory)"
+        help="Output PDF filename"
     )
     parser.add_argument(
         "--highlight-tag", "-t",
         default="#r",
-        help="Tag to look for in event titles (default: '#highlight'). "
-             "Events ending with this tag will trigger cell highlighting "
-             "and the tag will be removed from the displayed text."
+        help="Tag to look for in event titles"
     )
     parser.add_argument(
         "--highlight-color", "-c",
         default="pink",
-        help="Color for highlighting. Can be: red, blue, green, yellow, pink, cyan, "
-             "or an RGB triple like '255,200,200' (default: 'red')"
+        help="Color for highlighting"
     )
-    
-    args = parser.parse_args(argv)
-    return args
 
+    args = parser.parse_args()
 
-@Gooey
-def main(argv: List[str]) -> None:
-    """
-    Main entry point for the calendar generator.
-    
-    Args:
-        argv: Command-line arguments (excluding program name).
-    """
-    args = parse_args(argv)
-    
+    # ---- everything that used to be in main() past parse_args ----
     year = args.year
     start_month = args.start_month
     ics_path = args.ics_path
     out_path = args.out
     highlight_tag = args.highlight_tag
     highlight_color = parse_color(args.highlight_color)
-    
-    # Compute the number of previous-month days to show for the first month
+
     first_day_weekday = date(year, start_month, 1).weekday()
     num_prev_first = (first_day_weekday + 1) % 7
     span_start = date(year, start_month, 1) - timedelta(days=num_prev_first)
-    
+
     end_year, end_month = month_year_after(year, start_month, 2)
     span_end = date(end_year, end_month, last_day_of_month(end_year, end_month))
-    
-    print(f"Using highlight tag: '{highlight_tag}'")
-    print(f"Using highlight color: {args.highlight_color}")
-    print(f"Event span: {span_start} to {span_end}")
-    
-    # Compute input directory
+
     input_dir = os.path.dirname(os.path.abspath(ics_path))
-    
-    # Determine output path
+
     if out_path is None:
         default_name = f"{year}_{start_month:02d}_calendar.pdf"
         out_path = os.path.join(input_dir, default_name)
     else:
-        if os.path.dirname(out_path) == '':
+        if os.path.dirname(out_path) == "":
             out_path = os.path.join(input_dir, out_path)
-        # If the filename has no extension, add .pdf
         base, ext = os.path.splitext(out_path)
         if not ext:
-            out_path += '.pdf'
-        
+            out_path += ".pdf"
+
     try:
         events = load_events_from_ics(
-            ics_path, span_start, span_end, highlight_tag,
-            default_tz=tzlocal()
+            ics_path, span_start, span_end, highlight_tag, default_tz=tzlocal()
         )
         draw_three_months_pdf(year, start_month, events, out_path, highlight_color)
-        
     except FileNotFoundError:
         print(f"\n🛑 ERROR: ICS file not found: {ics_path}")
         sys.exit(1)
-        
     except PermissionError as e:
         print(f"\n🛑 ERROR: Permission denied: {e}")
-        print("Check file permissions and try again.")
         sys.exit(1)
         
     except IOError as e:
@@ -1245,4 +1197,4 @@ def main(argv: List[str]) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()
