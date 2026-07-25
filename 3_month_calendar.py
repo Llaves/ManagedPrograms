@@ -611,6 +611,9 @@ def load_events_from_ics(
         # Check if this is a recurring event
         rrule_prop = component.get("RRULE")
         is_recurring = rrule_prop is not None
+
+        # Determine if this specific component is the exception itself
+        is_exception_component = component.get("RECURRENCE-ID") is not None
         
         # Expand occurrences
         if rrule_prop:
@@ -628,9 +631,11 @@ def load_events_from_ics(
         
         # Add each occurrence to the date map
         for occ_dt in occurrences:
-            # Skip if this occurrence is in the recurrence exceptions (RECURRENCE-ID)
             occ_date = occ_dt.date()
-            if occ_date in recurrence_exceptions.get(uid, set()):
+            
+            # Skip if this occurrence is overridden by an exception, 
+            # BUT do not skip if we are currently parsing the exception itself!
+            if not is_exception_component and occ_date in recurrence_exceptions.get(uid, set()):
                 continue
             
             add_event_to_dates(
@@ -948,6 +953,33 @@ def draw_cell_events(
 # ---------------------------------------------------------
 # PDF Generation - Main Function
 # ---------------------------------------------------------
+def _get_previous_month_info(year: int, month: int) -> Tuple[int, int, int]:
+    """Calculate the year, month, and last day of the previous month[cite: 1]."""
+    if month == 1:
+        prev_year, prev_month = year - 1, 12
+    else:
+        prev_year, prev_month = year, month - 1
+    return prev_year, prev_month, last_day_of_month(prev_year, prev_month)
+
+def _get_cell_date(
+    month_idx: int, row_idx: int, col: int, daynum: int, 
+    mdata: MonthData, num_prev: int, 
+    prev_y: int, prev_m: int, prev_last_day: int
+) -> Tuple[Optional[date], bool]:
+    """
+    Determine the actual date for a cell, returning (date_obj, is_prev_month)[cite: 1].
+    Returns (None, False) for empty cells[cite: 1].
+    """
+    if daynum != 0:
+        return date(mdata.year, mdata.month, daynum), False
+    
+    # Only show previous-month days in the first week of the very first month[cite: 1]
+    if month_idx == 0 and row_idx == 0 and col < num_prev:
+        prev_day = prev_last_day - (num_prev - 1 - col)
+        return date(prev_y, prev_m, prev_day), True
+        
+    return None, False
+
 def draw_three_months_pdf(
     year: int,
     start_month: int,
@@ -956,24 +988,24 @@ def draw_three_months_pdf(
     highlight_color: Color
 ) -> None:
     """
-    Generate a 3-month calendar PDF.
+    Generate a 3-month calendar PDF[cite: 1].
     
     Args:
-        year: The starting year.
-        start_month: The starting month (1-12).
-        events_by_date: Dictionary mapping dates to event lists.
-        out_path: Output PDF file path.
-        highlight_color: Color to use for highlighted cells.
+        year: The starting year[cite: 1].
+        start_month: The starting month (1-12)[cite: 1].
+        events_by_date: Dictionary mapping dates to event lists[cite: 1].
+        out_path: Output PDF file path[cite: 1].
+        highlight_color: Color to use for highlighted cells[cite: 1].
     
     Raises:
-        IOError: If the file cannot be written.
+        IOError: If the file cannot be written[cite: 1].
     """
     c = canvas.Canvas(out_path, pagesize=(PAGE_WIDTH, PAGE_HEIGHT))
     
     usable_w = PAGE_WIDTH - 2 * PAGE_MARGIN
     usable_h = PAGE_HEIGHT - 2 * PAGE_MARGIN
     
-    # Calculate layout
+    # Calculate layout[cite: 1]
     month_data, total_rows = calculate_month_layout(year, start_month)
     total_grid_space = usable_h - 3 * (MONTH_HEADER_HEIGHT + WEEKDAY_ROW_HEIGHT)
     row_height = total_grid_space / total_rows
@@ -981,7 +1013,7 @@ def draw_three_months_pdf(
     
     current_y = PAGE_HEIGHT - PAGE_MARGIN
     
-    # Iterate over the three months with an index
+    # Iterate over the three months with an index[cite: 1]
     for month_idx, mdata in enumerate(month_data):
         month_height = MONTH_HEADER_HEIGHT + WEEKDAY_ROW_HEIGHT + (mdata.num_rows * row_height)
         
@@ -990,104 +1022,65 @@ def draw_three_months_pdf(
         box_w = usable_w
         box_h = month_height
         
-        # Draw headers
+        # Draw headers[cite: 1]
         draw_month_header(c, mdata, box_x, box_y, box_w, box_h)
         
-        # Compute previous month info for filling in leading zeros in first week
-        first_day_weekday = date(mdata.year, mdata.month, 1).weekday()  # 0=Mon, 6=Sun
-        num_prev = (first_day_weekday + 1) % 7  # days from previous month
+        # Compute previous month info for filling in leading zeros in first week[cite: 1]
+        first_day_weekday = date(mdata.year, mdata.month, 1).weekday()
+        num_prev = (first_day_weekday + 1) % 7 
+        prev_y, prev_m, prev_last_day = _get_previous_month_info(mdata.year, mdata.month)
         
-        # Compute previous month's year and month
-        if mdata.month == 1:
-            prev_year = mdata.year - 1
-            prev_month = 12
-        else:
-            prev_year = mdata.year
-            prev_month = mdata.month - 1
-        prev_last_day = last_day_of_month(prev_year, prev_month)
-        
-        # FIRST PASS: Draw background highlights (so they don't cover borders)
-        for row_idx in range(mdata.num_rows):
-            week = mdata.weeks[row_idx]
-            
-            for col in range(7):
-                x = box_x + col * cell_w
-                grid_top_y = box_y + box_h - MONTH_HEADER_HEIGHT - WEEKDAY_ROW_HEIGHT
-                y = grid_top_y - (row_idx + 1) * row_height
-                
-                daynum = week[col]
-                if daynum == 0:
-                    # Only show previous-month days in the first month
-                    if month_idx == 0 and row_idx == 0 and col < num_prev:
-                        prev_day = prev_last_day - (num_prev - 1 - col)
-                        actual_date = date(prev_year, prev_month, prev_day)
-                        evs = events_by_date.get(actual_date, [])
-                        highlight_type = should_highlight_cell(evs, actual_date)
-                        if highlight_type:
-                            draw_highlight(c, x, y, cell_w, row_height, highlight_type, highlight_color)
-                    continue
-                
-                this_date = date(mdata.year, mdata.month, daynum)
-                evs = events_by_date.get(this_date, [])
-                highlight_type = should_highlight_cell(evs, this_date)
-                if highlight_type:
-                    draw_highlight(c, x, y, cell_w, row_height, highlight_type, highlight_color)
-        
-        # SECOND PASS: Draw grid lines and content
-        for row_idx in range(mdata.num_rows):
-            week = mdata.weeks[row_idx]
-            
-            for col in range(7):
-                x = box_x + col * cell_w
-                grid_top_y = box_y + box_h - MONTH_HEADER_HEIGHT - WEEKDAY_ROW_HEIGHT
-                y = grid_top_y - (row_idx + 1) * row_height
-                
-                # Draw cell border
-                c.rect(x, y, cell_w, row_height, stroke=1, fill=0)
-                
-                daynum = week[col]
-                if daynum == 0:
-                    # Only show previous-month days in the first month
-                    if month_idx == 0 and row_idx == 0 and col < num_prev:
-                        prev_day = prev_last_day - (num_prev - 1 - col)
-                        actual_date = date(prev_year, prev_month, prev_day)
-                        # Draw day number in gray
-                        c.setFillColor(parse_color('gray'))
+        grid_top_y = box_y + box_h - MONTH_HEADER_HEIGHT - WEEKDAY_ROW_HEIGHT
+
+        def process_cells(is_first_pass: bool) -> None:
+            """Helper to process the month grid to avoid duplicate loops[cite: 1]."""
+            for row_idx in range(mdata.num_rows):
+                for col in range(7):
+                    x = box_x + col * cell_w
+                    y = grid_top_y - (row_idx + 1) * row_height
+                    daynum = mdata.weeks[row_idx][col]
+                    
+                    actual_date, is_prev = _get_cell_date(
+                        month_idx, row_idx, col, daynum, mdata, 
+                        num_prev, prev_y, prev_m, prev_last_day
+                    )
+                    
+                    # Skip empty cells on pass 1; draw empty borders on pass 2[cite: 1]
+                    if actual_date is None:
+                        if not is_first_pass and daynum == 0:
+                            c.rect(x, y, cell_w, row_height, stroke=1, fill=0)
+                        continue
+                        
+                    evs = events_by_date.get(actual_date, [])
+                    
+                    if is_first_pass:
+                        # FIRST PASS: Draw background highlights so they don't cover borders[cite: 1]
+                        hl_type = should_highlight_cell(evs, actual_date)
+                        if hl_type:
+                            draw_highlight(c, x, y, cell_w, row_height, hl_type, highlight_color)
+                    else:
+                        # SECOND PASS: Draw grid lines and content[cite: 1]
+                        c.rect(x, y, cell_w, row_height, stroke=1, fill=0)
+                        
+                        # Draw day number (gray for previous month)[cite: 1]
+                        c.setFillColor(parse_color('gray') if is_prev else Color(0,0,0,1))
                         c.setFont(FONT_NORMAL, DAY_NUMBER_FONT_SIZE)
-                        c.drawString(
-                            x + DAY_NUMBER_OFFSET_X, 
-                            y + row_height - DAY_NUMBER_OFFSET_Y, 
-                            str(prev_day)
-                        )
-                        c.setFillColorRGB(0, 0, 0)  # Reset to black
-                        # Draw events for that date
-                        evs = events_by_date.get(actual_date, [])
+                        c.drawString(x + DAY_NUMBER_OFFSET_X, y + row_height - DAY_NUMBER_OFFSET_Y, str(actual_date.day))
+                        c.setFillColorRGB(0, 0, 0)
+                        
+                        # Draw events[cite: 1]
                         if evs:
-                            frame_x = x + CELL_PAD_LEFT
-                            frame_y = y + CELL_PAD_BOTTOM
-                            frame_w = cell_w - (CELL_PAD_LEFT + CELL_PAD_RIGHT)
-                            frame_h = row_height - (CELL_PAD_TOP + CELL_PAD_BOTTOM)
-                            draw_cell_events(c, evs, frame_x, frame_y, frame_w, frame_h)
-                    # If not first month, leave cell empty (only border drawn)
-                    continue
-                
-                # Current month day
-                c.setFont(FONT_NORMAL, DAY_NUMBER_FONT_SIZE)
-                c.drawString(
-                    x + DAY_NUMBER_OFFSET_X, 
-                    y + row_height - DAY_NUMBER_OFFSET_Y, 
-                    str(daynum)
-                )
-                
-                # Events for current month day
-                this_date = date(mdata.year, mdata.month, daynum)
-                evs = events_by_date.get(this_date, [])
-                if evs:
-                    frame_x = x + CELL_PAD_LEFT
-                    frame_y = y + CELL_PAD_BOTTOM
-                    frame_w = cell_w - (CELL_PAD_LEFT + CELL_PAD_RIGHT)
-                    frame_h = row_height - (CELL_PAD_TOP + CELL_PAD_BOTTOM)
-                    draw_cell_events(c, evs, frame_x, frame_y, frame_w, frame_h)
+                            draw_cell_events(
+                                c, evs, 
+                                x + CELL_PAD_LEFT, 
+                                y + CELL_PAD_BOTTOM, 
+                                cell_w - (CELL_PAD_LEFT + CELL_PAD_RIGHT), 
+                                row_height - (CELL_PAD_TOP + CELL_PAD_BOTTOM)
+                            )
+
+        # Execute the two rendering passes[cite: 1]
+        process_cells(is_first_pass=True)
+        process_cells(is_first_pass=False)
         
         current_y = box_y
     
