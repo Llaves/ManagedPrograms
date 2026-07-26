@@ -209,339 +209,6 @@ def last_day_of_month(year: int, month: int) -> int:
 # ---------------------------------------------------------
 # ICS Parsing - Helper Functions
 # ---------------------------------------------------------
-def extract_calendar_timezone(cal: Calendar, default_tz: Optional[tzinfo] = None) -> tzinfo:
-    """
-    Extract the timezone from a calendar, or return a default.
-    
-    Args:
-        cal: The parsed iCalendar object.
-        default_tz: Fallback timezone if none found in calendar.
-    
-    Returns:
-        The calendar's timezone or the default.
-    """
-    for comp in cal.walk():
-        if comp.name == "VTIMEZONE":
-            tzid = comp.get("TZID")
-            if tzid:
-                tz = gettz(str(tzid))
-                if tz:
-                    return tz
-    return default_tz or tzlocal()
-
-
-def collect_recurrence_exceptions(cal: Calendar) -> Dict[str, Set[date]]:
-    """
-    Collect all RECURRENCE-ID exceptions from a calendar.
-    
-    These represent modified instances of recurring events that should
-    be excluded from normal recurrence expansion.
-    
-    Args:
-        cal: The parsed iCalendar object.
-    
-    Returns:
-        Dictionary mapping event UID to set of exception dates.
-    """
-    exceptions: Dict[str, Set[date]] = defaultdict(set)
-    
-    for component in cal.walk():
-        if component.name != "VEVENT":
-            continue
-        
-        uid = str(component.get("UID", ""))
-        recurrence_id = component.get("RECURRENCE-ID")
-        
-        if recurrence_id:
-            try:
-                rid_dt = component.decoded("RECURRENCE-ID")
-                if isinstance(rid_dt, datetime):
-                    exceptions[uid].add(rid_dt.date())
-                elif isinstance(rid_dt, date):
-                    exceptions[uid].add(rid_dt)
-            except (KeyError, ValueError, TypeError) as e:
-                print(f"Warning: Could not parse RECURRENCE-ID for {uid}: {e}")
-    
-    return exceptions
-
-
-def collect_exdate_dates(component: Component) -> Set[date]:
-    exdates: Set[date] = set()
-    exdate_prop = component.get("EXDATE")
-
-    if not exdate_prop:
-        return exdates
-
-    def add_exdate(value):
-        if isinstance(value, datetime):
-            exdates.add(value.date())
-        elif isinstance(value, date):
-            exdates.add(value)
-
-    items = exdate_prop if isinstance(exdate_prop, list) else [exdate_prop]
-
-    for item in items:
-        if hasattr(item, "dts"):
-            for dt in item.dts:
-                add_exdate(dt.dt if hasattr(dt, "dt") else dt)
-        else:
-            add_exdate(item)
-
-    return exdates
-
-
-def normalize_datetime(
-    dt: Optional[Union[date, datetime]], 
-    cal_tz: tzinfo
-) -> Optional[Union[date, datetime]]:
-    """
-    Normalize a datetime to be timezone-aware.
-    
-    Args:
-        dt: The date or datetime to normalize.
-        cal_tz: The calendar timezone to apply if dt is naive.
-    
-    Returns:
-        The normalized datetime, or None if input was None.
-    """
-    if dt is None:
-        return None
-    # All-day events (date objects) are returned as-is
-    if isinstance(dt, date) and not isinstance(dt, datetime):
-        return dt
-    # Make naive datetimes timezone-aware
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=cal_tz)
-    return dt
-
-
-def parse_rrule_until_date(rrule_str: str) -> Tuple[str, Optional[date]]:
-    """
-    Parse and extract the UNTIL date from an RRULE string.
-    
-    Args:
-        rrule_str: The raw RRULE string.
-    
-    Returns:
-        Tuple of (cleaned_rrule_string, until_date or None).
-    """
-    parts = rrule_str.split(';')
-    cleaned_parts = []
-    until_date = None
-    
-    for part in parts:
-        if part.startswith('UNTIL='):
-            until_val = part.split('=', 1)[1]
-            try:
-                if len(until_val) >= 8:
-                    until_date = datetime.strptime(until_val[:8], '%Y%m%d').date()
-            except ValueError:
-                pass  # Keep until_date as None if parsing fails
-        else:
-            cleaned_parts.append(part)
-    
-    return ';'.join(cleaned_parts), until_date
-
-
-def expand_recurrence(
-    component: Component,
-    dtstart: Union[date, datetime],
-    cal_tz: tzinfo,
-    span_start_dt: datetime,
-    span_end_dt: datetime,
-    uid: str,
-    exdates: Set[date]
-) -> List[datetime]:
-    """
-    Expand recurring event occurrences within a date span.
-    
-    Args:
-        component: The VEVENT component.
-        dtstart: The event start date/datetime.
-        cal_tz: The calendar timezone.
-        span_start_dt: Start of the date range to expand.
-        span_end_dt: End of the date range to expand.
-        uid: Event UID for error messages.
-        exdates: Set of dates to exclude from recurrence.
-    
-    Returns:
-        List of occurrence datetimes.
-    """
-    occurrences: List[datetime] = []
-    rrule_prop = component.get("RRULE")
-    
-    if not rrule_prop:
-        return occurrences
-    
-    try:
-        # Prepare DTSTART anchor as aware datetime
-        if isinstance(dtstart, date) and not isinstance(dtstart, datetime):
-            rrule_anchor = datetime.combine(dtstart, time.min).replace(tzinfo=cal_tz)
-        else:
-            rrule_anchor = dtstart
-        
-        # Parse RRULE string
-        rrule_raw = rrule_prop.to_ical()
-        rrule_ical = rrule_raw.decode() if isinstance(rrule_raw, bytes) else rrule_raw
-        rrule_str = rrule_ical.split(":", 1)[1] if ":" in rrule_ical else rrule_ical
-        
-        # Extract and handle UNTIL date separately
-        rrule_cleaned, manual_until = parse_rrule_until_date(rrule_str)
-        
-        # Build rruleset and expand
-        rs = rruleset()
-        rr = rrulestr(rrule_cleaned, dtstart=rrule_anchor)
-        rs.rrule(rr)
-        
-        # Add EXDATEs
-        for exdate in exdates:
-            exdate_dt = datetime.combine(exdate, time.min).replace(tzinfo=cal_tz)
-            rs.exdate(exdate_dt)
-        
-        raw_occs = rs.between(
-            span_start_dt - timedelta(days=1),
-            span_end_dt + timedelta(days=1),
-            inc=True
-        )
-        
-        # Filter by manual UNTIL date if present
-        if manual_until:
-            raw_occs = [
-                occ for occ in raw_occs 
-                if (occ.date() if isinstance(occ, datetime) else occ) <= manual_until
-            ]
-        
-        # Normalize occurrences
-        for occ in raw_occs:
-            if isinstance(occ, datetime):
-                occ_date = occ.date()
-            elif isinstance(occ, date):
-                occ_date = occ
-            else:
-                continue
-            
-            if isinstance(dtstart, date) and not isinstance(dtstart, datetime):
-                # All-day event
-                occ_local = datetime.combine(occ_date, time.min).replace(tzinfo=cal_tz)
-            else:
-                # Timed event
-                occ_local = occ if occ.tzinfo else occ.replace(tzinfo=cal_tz)
-            
-            occurrences.append(occ_local)
-            
-    except (ValueError, TypeError, AttributeError) as e:
-        print(f"Warning: Failed to parse RRULE for {uid}: {e}")
-    
-    return occurrences
-
-
-def get_event_end_date(
-    component: Component,
-    dtstart: Union[date, datetime]
-) -> Optional[Union[date, datetime]]:
-    """
-    Get the end date/datetime of an event.
-    
-    Args:
-        component: The VEVENT component.
-        dtstart: The event start date/datetime.
-    
-    Returns:
-        The event end, or None if not specified.
-    """
-    if component.get("DTEND") is not None:
-        return component.decoded("DTEND")
-    
-    if component.get("DURATION") is not None:
-        try:
-            duration = component.get("DURATION").dt
-            return dtstart + duration
-        except (AttributeError, TypeError):
-            return None
-    
-    return None
-
-
-def add_event_to_dates(
-    events_by_date: Dict[date, List[CalEvent]],
-    occ_dt: datetime,
-    dtstart: Union[date, datetime],
-    dtend_t: Optional[Union[date, datetime]],
-    dtstart_t: Optional[Union[date, datetime]],
-    summary: str,
-    raw_summary: str,
-    uid: str,
-    span_start_date: date,
-    span_end_date: date,
-    is_recurring: bool = False,
-    should_highlight: bool = False
-) -> None:
-    """
-    Add an event occurrence to the events_by_date dictionary.
-
-    Multi-day events are added to each date they span.
-
-    Args:
-        events_by_date: Dictionary to populate.
-        occ_dt: The occurrence datetime.
-        dtstart: Original event start.
-        dtend_t: Normalized event end.
-        dtstart_t: Normalized event start.
-        summary: Cleaned event title.
-        raw_summary: Original event title (with tag).
-        uid: Event UID.
-        span_start_date: Start of visible date range.
-        span_end_date: End of visible date range.
-        is_recurring: Whether this is from a recurring event.
-        should_highlight: Whether this event should trigger highlighting.
-    """
-    is_all_day = isinstance(dtstart, date) and not isinstance(dtstart, datetime)
-    start_d = occ_dt.date()
-
-    # Calculate end date
-    if dtend_t is None:
-        end_d = start_d
-    elif isinstance(dtend_t, date) and not isinstance(dtend_t, datetime):
-        offset_days = (dtend_t - dtstart_t).days
-        end_d = start_d + timedelta(days=offset_days)
-    else:
-        offset_td = dtend_t - dtstart_t
-        end_d = (occ_dt + offset_td).date()
-
-    # Calculate inclusive display end date
-    if dtend_t is None:
-        display_end_d = start_d
-    elif is_all_day:
-        offset_days = (dtend_t - dtstart_t).days
-        # DTEND is exclusive for all-day events
-        display_end_d = start_d + timedelta(days=offset_days - 1)
-    else:
-        offset_td = dtend_t - dtstart_t
-        display_end_d = (occ_dt + offset_td).date()
-
-    # Create event object
-    ev = CalEvent(
-        start=occ_dt,
-        end=display_end_d if display_end_d > start_d else None,
-        all_day=is_all_day,
-        title=summary,
-        raw_title=raw_summary,
-        uid=uid,
-        is_recurring=is_recurring,
-        should_highlight=should_highlight
-    )
-
-    # Add to each date in the span (inclusive)
-    cur = start_d
-    while cur <= display_end_d:
-        if span_start_date <= cur <= span_end_date:
-            events_by_date[cur].append(ev)
-        cur += timedelta(days=1)
-
-
-# ---------------------------------------------------------
-# ICS Parsing Class
-# ---------------------------------------------------------
 class ICSEventParser:
     """
     Parses an ICS file and extracts events falling within a specific date range,
@@ -575,19 +242,17 @@ class ICSEventParser:
         with open(self.ics_path, "rb") as f:
             cal = Calendar.from_ical(f.read())
         
-        # Setup calendar state
-        self.cal_tz = extract_calendar_timezone(cal, self.default_tz)
-        self.recurrence_exceptions = collect_recurrence_exceptions(cal)
+        self.cal_tz = self._extract_calendar_timezone(cal, self.default_tz)
+        self.recurrence_exceptions = self._collect_recurrence_exceptions(cal)
         
         self.span_start_dt = datetime.combine(self.span_start_date, time.min).replace(tzinfo=self.cal_tz)
         self.span_end_dt = datetime.combine(self.span_end_date, time.max).replace(tzinfo=self.cal_tz)
         
-        # Process each component[cite: 1]
         for component in cal.walk():
             if component.name == "VEVENT":
                 self._process_vevent(component)
         
-        # Sort events within each date[cite: 1]
+        # Sort events within each date
         for d in self.events_by_date:
             self.events_by_date[d].sort(key=lambda e: (not e.all_day, e.start))
             
@@ -601,6 +266,8 @@ class ICSEventParser:
             
         uid = str(component.get("UID", ""))
         raw_summary = str(component.get("SUMMARY", ""))
+        
+        # Note: extract_tag_from_title remains a module-level function since it operates purely on strings
         clean_summary, has_tag = extract_tag_from_title(raw_summary, self.highlight_tag)
         
         try:
@@ -609,21 +276,17 @@ class ICSEventParser:
             print(f"Warning: Could not parse DTSTART for event: {e}")
             return
             
-        dtend = get_event_end_date(component, dtstart)
-        dtstart_t = normalize_datetime(dtstart, self.cal_tz)
-        dtend_t = normalize_datetime(dtend, self.cal_tz)
+        dtend = self._get_event_end_date(component, dtstart)
+        dtstart_t = self._normalize_datetime(dtstart, self.cal_tz)
+        dtend_t = self._normalize_datetime(dtend, self.cal_tz)
         
-        exdates = collect_exdate_dates(component)
+        exdates = self._collect_exdate_dates(component)
         rrule_prop = component.get("RRULE")
         is_recurring = rrule_prop is not None
         is_exception_component = component.get("RECURRENCE-ID") is not None
         
-        # Expand or create single occurrence
         if rrule_prop:
-            occurrences = expand_recurrence(
-                component, dtstart, self.cal_tz, 
-                self.span_start_dt, self.span_end_dt, uid, exdates
-            )
+            occurrences = self._expand_recurrence(component, dtstart, uid, exdates)
         else:
             if isinstance(dtstart_t, date) and not isinstance(dtstart_t, datetime):
                 occ = datetime.combine(dtstart_t, time.min).replace(tzinfo=self.cal_tz)
@@ -651,54 +314,226 @@ class ICSEventParser:
             if not is_exception_component and occ_date in self.recurrence_exceptions.get(uid, set()):
                 continue
             
-            add_event_to_dates(
-                self.events_by_date, occ_dt, dtstart, dtend_t, dtstart_t,
+            self._add_event_to_dates(
+                occ_dt, dtstart, dtend_t, dtstart_t,
                 clean_summary, raw_summary, uid, 
-                self.span_start_date, self.span_end_date,
                 is_recurring, has_tag
             )
 
+    # ---------------------------------------------------------
+    # Instance Methods (State-Dependent)
+    # ---------------------------------------------------------
+    
+    def _expand_recurrence(
+        self, component: Component, dtstart: Union[date, datetime], 
+        uid: str, exdates: Set[date]
+    ) -> List[datetime]:
+        """Expand recurring event occurrences within the instance's date span."""
+        occurrences: List[datetime] = []
+        rrule_prop = component.get("RRULE")
+        
+        try:
+            if isinstance(dtstart, date) and not isinstance(dtstart, datetime):
+                rrule_anchor = datetime.combine(dtstart, time.min).replace(tzinfo=self.cal_tz)
+            else:
+                rrule_anchor = dtstart
+            
+            rrule_raw = rrule_prop.to_ical()
+            rrule_ical = rrule_raw.decode() if isinstance(rrule_raw, bytes) else rrule_raw
+            rrule_str = rrule_ical.split(":", 1)[1] if ":" in rrule_ical else rrule_ical
+            
+            rrule_cleaned, manual_until = self._parse_rrule_until_date(rrule_str)
+            
+            rs = rruleset()
+            rr = rrulestr(rrule_cleaned, dtstart=rrule_anchor)
+            rs.rrule(rr)
+            
+            for exdate in exdates:
+                exdate_dt = datetime.combine(exdate, time.min).replace(tzinfo=self.cal_tz)
+                rs.exdate(exdate_dt)
+            
+            raw_occs = rs.between(
+                self.span_start_dt - timedelta(days=1),
+                self.span_end_dt + timedelta(days=1),
+                inc=True
+            )
+            
+            if manual_until:
+                raw_occs = [
+                    occ for occ in raw_occs 
+                    if (occ.date() if isinstance(occ, datetime) else occ) <= manual_until
+                ]
+            
+            for occ in raw_occs:
+                if isinstance(occ, datetime):
+                    occ_date = occ.date()
+                elif isinstance(occ, date):
+                    occ_date = occ
+                else:
+                    continue
+                
+                if isinstance(dtstart, date) and not isinstance(dtstart, datetime):
+                    occ_local = datetime.combine(occ_date, time.min).replace(tzinfo=self.cal_tz)
+                else:
+                    occ_local = occ if occ.tzinfo else occ.replace(tzinfo=self.cal_tz)
+                
+                occurrences.append(occ_local)
+                
+        except (ValueError, TypeError, AttributeError) as e:
+            print(f"Warning: Failed to parse RRULE for {uid}: {e}")
+        
+        return occurrences
 
-# ---------------------------------------------------------
-# Text Wrapping
-# ---------------------------------------------------------
-def wrap_text_to_lines(
-    text: str, 
-    fontname: str, 
-    fontsize: float, 
-    max_width: float
-) -> List[str]:
-    """
-    Wrap text to fit within a maximum width.
-    
-    Args:
-        text: The text to wrap.
-        fontname: The font name for width calculation.
-        fontsize: The font size for width calculation.
-        max_width: Maximum line width in points.
-    
-    Returns:
-        List of wrapped lines.
-    """
-    words = text.split()
-    if not words:
-        return [""]
-    
-    lines: List[str] = []
-    current_line = words[0]
-    
-    for word in words[1:]:
-        trial = f"{current_line} {word}"
-        if pdfmetrics.stringWidth(trial, fontname, fontsize) <= max_width:
-            current_line = trial
+    def _add_event_to_dates(
+        self, occ_dt: datetime, dtstart: Union[date, datetime],
+        dtend_t: Optional[Union[date, datetime]], dtstart_t: Optional[Union[date, datetime]],
+        summary: str, raw_summary: str, uid: str, 
+        is_recurring: bool, should_highlight: bool
+    ) -> None:
+        """Add an event occurrence to the instance's events dictionary."""
+        is_all_day = isinstance(dtstart, date) and not isinstance(dtstart, datetime)
+        start_d = occ_dt.date()
+
+        if dtend_t is None:
+            end_d = start_d
+        elif isinstance(dtend_t, date) and not isinstance(dtend_t, datetime):
+            offset_days = (dtend_t - dtstart_t).days
+            end_d = start_d + timedelta(days=offset_days)
         else:
-            lines.append(current_line)
-            current_line = word
-    
-    lines.append(current_line)
-    return lines
+            offset_td = dtend_t - dtstart_t
+            end_d = (occ_dt + offset_td).date()
 
+        if dtend_t is None:
+            display_end_d = start_d
+        elif is_all_day:
+            offset_days = (dtend_t - dtstart_t).days
+            display_end_d = start_d + timedelta(days=offset_days - 1)
+        else:
+            offset_td = dtend_t - dtstart_t
+            display_end_d = (occ_dt + offset_td).date()
 
+        ev = CalEvent(
+            start=occ_dt,
+            end=display_end_d if display_end_d > start_d else None,
+            all_day=is_all_day,
+            title=summary,
+            raw_title=raw_summary,
+            uid=uid,
+            is_recurring=is_recurring,
+            should_highlight=should_highlight
+        )
+
+        cur = start_d
+        while cur <= display_end_d:
+            if self.span_start_date <= cur <= self.span_end_date:
+                self.events_by_date[cur].append(ev)
+            cur += timedelta(days=1)
+
+    # ---------------------------------------------------------
+    # Static Methods (Stateless Utilities)
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _extract_calendar_timezone(cal: Calendar, default_tz: Optional[tzinfo] = None) -> tzinfo:
+        for comp in cal.walk():
+            if comp.name == "VTIMEZONE":
+                tzid = comp.get("TZID")
+                if tzid:
+                    tz = gettz(str(tzid))
+                    if tz:
+                        return tz
+        return default_tz or tzlocal()
+
+    @staticmethod
+    def _collect_recurrence_exceptions(cal: Calendar) -> Dict[str, Set[date]]:
+        exceptions: Dict[str, Set[date]] = defaultdict(set)
+        
+        for component in cal.walk():
+            if component.name != "VEVENT":
+                continue
+            
+            uid = str(component.get("UID", ""))
+            recurrence_id = component.get("RECURRENCE-ID")
+            
+            if recurrence_id:
+                try:
+                    rid_dt = component.decoded("RECURRENCE-ID")
+                    if isinstance(rid_dt, datetime):
+                        exceptions[uid].add(rid_dt.date())
+                    elif isinstance(rid_dt, date):
+                        exceptions[uid].add(rid_dt)
+                except (KeyError, ValueError, TypeError) as e:
+                    print(f"Warning: Could not parse RECURRENCE-ID for {uid}: {e}")
+        
+        return exceptions
+
+    @staticmethod
+    def _collect_exdate_dates(component: Component) -> Set[date]:
+        exdates: Set[date] = set()
+        exdate_prop = component.get("EXDATE")
+
+        if not exdate_prop:
+            return exdates
+
+        def add_exdate(value):
+            if isinstance(value, datetime):
+                exdates.add(value.date())
+            elif isinstance(value, date):
+                exdates.add(value)
+
+        items = exdate_prop if isinstance(exdate_prop, list) else [exdate_prop]
+
+        for item in items:
+            if hasattr(item, "dts"):
+                for dt in item.dts:
+                    add_exdate(dt.dt if hasattr(dt, "dt") else dt)
+            else:
+                add_exdate(item)
+
+        return exdates
+
+    @staticmethod
+    def _normalize_datetime(dt: Optional[Union[date, datetime]], cal_tz: tzinfo) -> Optional[Union[date, datetime]]:
+        if dt is None:
+            return None
+        if isinstance(dt, date) and not isinstance(dt, datetime):
+            return dt
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=cal_tz)
+        return dt
+
+    @staticmethod
+    def _parse_rrule_until_date(rrule_str: str) -> Tuple[str, Optional[date]]:
+        parts = rrule_str.split(';')
+        cleaned_parts = []
+        until_date = None
+        
+        for part in parts:
+            if part.startswith('UNTIL='):
+                until_val = part.split('=', 1)[1]
+                try:
+                    if len(until_val) >= 8:
+                        until_date = datetime.strptime(until_val[:8], '%Y%m%d').date()
+                except ValueError:
+                    pass
+            else:
+                cleaned_parts.append(part)
+        
+        return ';'.join(cleaned_parts), until_date
+
+    @staticmethod
+    def _get_event_end_date(component: Component, dtstart: Union[date, datetime]) -> Optional[Union[date, datetime]]:
+        if component.get("DTEND") is not None:
+            return component.decoded("DTEND")
+        
+        if component.get("DURATION") is not None:
+            try:
+                duration = component.get("DURATION").dt
+                return dtstart + duration
+            except (AttributeError, TypeError):
+                return None
+        
+        return None
 # ---------------------------------------------------------
 # PDF Generation - Helper Functions
 # ---------------------------------------------------------
@@ -957,12 +792,49 @@ def draw_cell_events(
         c.setFont(FONT_NORMAL, EVENT_FONT_SIZE)
         c.drawString(frame_x, frame_y + 2, f"+{leftover} more")
 
-
+# ---------------------------------------------------------
+# Text Wrapping
+# ---------------------------------------------------------
+def wrap_text_to_lines(
+    text: str, 
+    fontname: str, 
+    fontsize: float, 
+    max_width: float
+) -> List[str]:
+    """
+    Wrap text to fit within a maximum width.
+    
+    Args:
+        text: The text to wrap.
+        fontname: The font name for width calculation.
+        fontsize: The font size for width calculation.
+        max_width: Maximum line width in points.
+    
+    Returns:
+        List of wrapped lines.
+    """
+    words = text.split()
+    if not words:
+        return [""]
+    
+    lines: List[str] = []
+    current_line = words[0]
+    
+    for word in words[1:]:
+        trial = f"{current_line} {word}"
+        if pdfmetrics.stringWidth(trial, fontname, fontsize) <= max_width:
+            current_line = trial
+        else:
+            lines.append(current_line)
+            current_line = word
+    
+    lines.append(current_line)
+    return lines
 # ---------------------------------------------------------
 # PDF Generation - Main Function
 # ---------------------------------------------------------
 def _get_previous_month_info(year: int, month: int) -> Tuple[int, int, int]:
-    """Calculate the year, month, and last day of the previous month[cite: 1]."""
+    """Calculate the year, month, and last day of the previous month."""
     if month == 1:
         prev_year, prev_month = year - 1, 12
     else:
@@ -975,13 +847,13 @@ def _get_cell_date(
     prev_y: int, prev_m: int, prev_last_day: int
 ) -> Tuple[Optional[date], bool]:
     """
-    Determine the actual date for a cell, returning (date_obj, is_prev_month)[cite: 1].
-    Returns (None, False) for empty cells[cite: 1].
+    Determine the actual date for a cell, returning (date_obj, is_prev_month).
+    Returns (None, False) for empty cells.
     """
     if daynum != 0:
         return date(mdata.year, mdata.month, daynum), False
     
-    # Only show previous-month days in the first week of the very first month[cite: 1]
+    # Only show previous-month days in the first week of the very first month
     if month_idx == 0 and row_idx == 0 and col < num_prev:
         prev_day = prev_last_day - (num_prev - 1 - col)
         return date(prev_y, prev_m, prev_day), True
@@ -996,24 +868,24 @@ def draw_three_months_pdf(
     highlight_color: Color
 ) -> None:
     """
-    Generate a 3-month calendar PDF[cite: 1].
+    Generate a 3-month calendar PDF.
     
     Args:
-        year: The starting year[cite: 1].
-        start_month: The starting month (1-12)[cite: 1].
-        events_by_date: Dictionary mapping dates to event lists[cite: 1].
-        out_path: Output PDF file path[cite: 1].
-        highlight_color: Color to use for highlighted cells[cite: 1].
+        year: The starting year.
+        start_month: The starting month (1-12).
+        events_by_date: Dictionary mapping dates to event lists.
+        out_path: Output PDF file path.
+        highlight_color: Color to use for highlighted cells.
     
     Raises:
-        IOError: If the file cannot be written[cite: 1].
+        IOError: If the file cannot be written.
     """
     c = canvas.Canvas(out_path, pagesize=(PAGE_WIDTH, PAGE_HEIGHT))
     
     usable_w = PAGE_WIDTH - 2 * PAGE_MARGIN
     usable_h = PAGE_HEIGHT - 2 * PAGE_MARGIN
     
-    # Calculate layout[cite: 1]
+    # Calculate layout
     month_data, total_rows = calculate_month_layout(year, start_month)
     total_grid_space = usable_h - 3 * (MONTH_HEADER_HEIGHT + WEEKDAY_ROW_HEIGHT)
     row_height = total_grid_space / total_rows
@@ -1021,7 +893,7 @@ def draw_three_months_pdf(
     
     current_y = PAGE_HEIGHT - PAGE_MARGIN
     
-    # Iterate over the three months with an index[cite: 1]
+    # Iterate over the three months with an index
     for month_idx, mdata in enumerate(month_data):
         month_height = MONTH_HEADER_HEIGHT + WEEKDAY_ROW_HEIGHT + (mdata.num_rows * row_height)
         
@@ -1030,10 +902,10 @@ def draw_three_months_pdf(
         box_w = usable_w
         box_h = month_height
         
-        # Draw headers[cite: 1]
+        # Draw headers
         draw_month_header(c, mdata, box_x, box_y, box_w, box_h)
         
-        # Compute previous month info for filling in leading zeros in first week[cite: 1]
+        # Compute previous month info for filling in leading zeros in first week
         first_day_weekday = date(mdata.year, mdata.month, 1).weekday()
         num_prev = (first_day_weekday + 1) % 7 
         prev_y, prev_m, prev_last_day = _get_previous_month_info(mdata.year, mdata.month)
@@ -1041,7 +913,7 @@ def draw_three_months_pdf(
         grid_top_y = box_y + box_h - MONTH_HEADER_HEIGHT - WEEKDAY_ROW_HEIGHT
 
         def process_cells(is_first_pass: bool) -> None:
-            """Helper to process the month grid to avoid duplicate loops[cite: 1]."""
+            """Helper to process the month grid to avoid duplicate loops."""
             for row_idx in range(mdata.num_rows):
                 for col in range(7):
                     x = box_x + col * cell_w
@@ -1053,7 +925,7 @@ def draw_three_months_pdf(
                         num_prev, prev_y, prev_m, prev_last_day
                     )
                     
-                    # Skip empty cells on pass 1; draw empty borders on pass 2[cite: 1]
+                    # Skip empty cells on pass 1; draw empty borders on pass 2
                     if actual_date is None:
                         if not is_first_pass and daynum == 0:
                             c.rect(x, y, cell_w, row_height, stroke=1, fill=0)
@@ -1062,21 +934,21 @@ def draw_three_months_pdf(
                     evs = events_by_date.get(actual_date, [])
                     
                     if is_first_pass:
-                        # FIRST PASS: Draw background highlights so they don't cover borders[cite: 1]
+                        # FIRST PASS: Draw background highlights so they don't cover borders
                         hl_type = should_highlight_cell(evs, actual_date)
                         if hl_type:
                             draw_highlight(c, x, y, cell_w, row_height, hl_type, highlight_color)
                     else:
-                        # SECOND PASS: Draw grid lines and content[cite: 1]
+                        # SECOND PASS: Draw grid lines and content
                         c.rect(x, y, cell_w, row_height, stroke=1, fill=0)
                         
-                        # Draw day number (gray for previous month)[cite: 1]
+                        # Draw day number (gray for previous month)
                         c.setFillColor(parse_color('gray') if is_prev else Color(0,0,0,1))
                         c.setFont(FONT_NORMAL, DAY_NUMBER_FONT_SIZE)
                         c.drawString(x + DAY_NUMBER_OFFSET_X, y + row_height - DAY_NUMBER_OFFSET_Y, str(actual_date.day))
                         c.setFillColorRGB(0, 0, 0)
                         
-                        # Draw events[cite: 1]
+                        # Draw events
                         if evs:
                             draw_cell_events(
                                 c, evs, 
@@ -1086,7 +958,7 @@ def draw_three_months_pdf(
                                 row_height - (CELL_PAD_TOP + CELL_PAD_BOTTOM)
                             )
 
-        # Execute the two rendering passes[cite: 1]
+        # Execute the two rendering passes
         process_cells(is_first_pass=True)
         process_cells(is_first_pass=False)
         
