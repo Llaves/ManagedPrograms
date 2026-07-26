@@ -4,6 +4,8 @@ import csv
 import sys
 import os
 from pathlib import Path
+import argparse
+from gooey import Gooey, GooeyParser
 
 def extract_invoice_data(pdf_path):
     """Extract data from condo invoice PDF"""
@@ -138,15 +140,21 @@ def write_to_csv(data, output_path):
     
     print(f"CSV file created successfully: {output_path}")
 
+@Gooey(program_name="Condo Invoice Parser", default_size=(450, 350))
 def main():
-    # Check for command line argument
-    if len(sys.argv) < 2:
-        print("Usage: python script.py <input_pdf_file>")
-        print("Example: python script.py 'Jan 2025.pdf'")
-        sys.exit(1)
+    # 1. Set up argparse instead of manual sys.argv checking
+    parser = GooeyParser(description="Extract data from a condo invoice PDF.")
     
-    # Get input PDF path from command line
-    pdf_path = sys.argv[1]
+    # 2. Add the PDF input argument with Gooey's FileChooser widget
+    parser.add_argument(
+        'pdf_path', 
+        help="Select the PDF invoice to parse", 
+        widget="FileChooser"
+    )
+    
+    # Parse the arguments (Gooey intercepts this to show the GUI)
+    args = parser.parse_args()
+    pdf_path = args.pdf_path
     
     # Check if file exists
     if not os.path.exists(pdf_path):
@@ -159,13 +167,17 @@ def main():
     
     # Extract data and write to CSV
     print(f"Reading invoice from: {pdf_path}")
+    
+    # (Assuming these functions are defined elsewhere in your script)
     data = extract_invoice_data(pdf_path)
     write_to_csv(data, output_path)
     
-    # Print summary
+    # Print summary (Gooey will display these prints in its execution window)
     print("\nExtracted Data:")
     for key, value in data.items():
         print(f"{key}: {value}")
+        
+    print(f"\nSuccessfully saved CSV to: {output_path}")
 
 if __name__ == "__main__":
     main()
